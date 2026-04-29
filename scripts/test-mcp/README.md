@@ -1,137 +1,177 @@
 # test-mcp
 
-Direct end-to-end smoke tester for Satva-hosted MCP servers. Speaks the
-Streamable-HTTP MCP protocol against the public URL — bypasses O-Bot
-entirely so you can verify the MCP itself works before doing the
-registry mapping inside O-Bot's UI.
+End-to-end smoke tester for Satva-hosted MCP servers. Two transports:
 
-This lives in `satva-git/obot` because it's an oBot-operations script;
-nothing in the obot Coolify deployment consumes it.
+| Transport | What it proves |
+|---|---|
+| **direct** | The MCP server itself responds correctly to the MCP protocol on its public URL. Bypasses O-Bot. |
+| **via-obot** | O-Bot can see the catalog entry and route through `/mcp-connect/{mcp_id}` — proves not just the MCP but that O-Bot's view of it is wired up. |
 
-## Why this exists
+Lives in `satva-git/obot` because the upstream mirror has no active
+deployment consuming it — the natural home for oBot ops scripts.
 
-O-Bot's documented API is scoped to `/mcp-connect/` and `/api/me`. There
-is no programmatic way to "log in as a user, sync the catalog, and click
-'test'." The catalog itself is GitOps: O-Bot polls `satva-git/mcp-catalog`
-on its own schedule. So validation is split:
+## What this does and doesn't replace
 
-1. **MCP responds correctly** — this script (talks to e.g. `https://instantlymcp.satva.xyz/mcp/instantly/`).
-2. **O-Bot picked up the catalog change** — visible in O-Bot Admin UI; not automatable from here.
-3. **Registry mapping** — manual one-time UI click per registry.
+✅ Full MCP protocol handshake, `tools/list`, `tools/call` against any MCP — direct or via O-Bot.
+✅ Liveness scan over every `satva-*.yaml` in the catalog repo.
+✅ Through-O-Bot scan over a name→mcp_id mapping you maintain locally.
 
-This script handles (1).
+❌ Cannot trigger an O-Bot catalog re-sync. The `/api/mcp-catalogs/*` endpoints
+   are admin-only; the OBOT_API_KEY is in the `api-key` group which is
+   restricted (verified in `pkg/api/authz/authz.go`) to:
+   - `GET /api/me`
+   - `/mcp-connect/`
+   O-Bot polls the catalog repo automatically (~1 min observed), so there's
+   nothing to trigger — just wait, then re-probe.
+❌ Cannot enumerate which MCPs are connected to your account programmatically
+   (same authz reason). You discover catalog-entry IDs from the O-Bot UI URL
+   bar and write them to a local mapping file.
 
-## Install
+## Setup
 
-Python 3.10+. `pyyaml` optional but recommended:
+Python 3.10+. PyYAML optional but recommended:
 
 ```
 pip install pyyaml
 ```
 
-If `pyyaml` is missing the script falls back to a tiny regex-based reader
-that handles the two fields it needs (`remoteConfig.fixedURL` and the
-first `headers[].key`).
+Secrets (read from `D:\oBot\.env`, gitignored):
 
-## Usage
+```
+OBOT_BASE_URL=https://obot.satva.xyz
+OBOT_API_KEY=ok1-...    # for --via-obot and --scan-via-obot only
+```
 
-### From a catalog YAML (preferred)
+Override `.env` location with `--env-file <path>` or env `ENV_FILE`.
 
-Reads `fixedURL` and the auth header name straight out of the catalog
-YAML so you only have to pass the API key.
+## Modes
+
+### Direct, catalog-aware
 
 ```
 python test_mcp.py --catalog satva-instantly --key $INSTANTLY_KEY
 ```
 
-`--catalog` can be the file basename with or without `.yaml`. The
-default catalog directory is `D:\oBot\.workspaces\mcp-catalog` (override
-with `--catalog-dir` or env `MCP_CATALOG_DIR`).
+Reads `fixedURL` and the auth-header name straight from
+`D:\oBot\.workspaces\mcp-catalog\satva-instantly.yaml`.
 
-### Manual override
-
-```
-python test_mcp.py \
-  --url https://instantlymcp.satva.xyz/mcp/instantly/ \
-  --header x-instantly-api-key \
-  --key $INSTANTLY_KEY
-```
-
-### Quick handshake only (no tools/list)
+### Direct, manual override
 
 ```
-python test_mcp.py --catalog satva-instantly --key $KEY --quick
+python test_mcp.py --url https://x.satva.xyz/mcp/x/ --header x-x-key --key $K
+python test_mcp.py --url https://example/ --no-auth     # for unauthenticated MCPs
+python test_mcp.py --catalog satva-instantly --key $KEY --quick   # handshake only
 ```
 
-### Run an actual tool call
-
-```
-python test_mcp.py --catalog satva-instantly --key $KEY \
-  --call campaigns_list --args '{"limit": 3}'
-```
-
-### Unauthenticated MCPs
-
-```
-python test_mcp.py --url https://example.com/mcp/foo/ --no-auth
-```
-
-## Stages
-
-The script runs these in order — failure at any stage exits with a
-distinct non-zero code so it's CI-friendly:
-
-| Stage | What it checks | Exit |
-|---|---|---|
-| `health` | Best-effort `GET /health` on the same origin (warning if absent — many MCPs don't implement this) | — (warning only) |
-| `initialize` | MCP `initialize` handshake; captures `Mcp-Session-Id` | 2 |
-| `tools/list` | Server returns its tool catalog | 3 |
-| `tools/call` | Optional. Runs the tool given by `--call` with `--args` JSON | 4 |
-
-Argument or config errors exit with `5`.
-
-## Examples
-
-Smoke a freshly-deployed Instantly MCP:
-
-```
-$ python test_mcp.py --catalog satva-instantly --key xxx
-Target: Satva Instantly
-  URL:    https://instantlymcp.satva.xyz/mcp/instantly/
-  Header: x-instantly-api-key
-  Key:    (provided)
-
-== health ==
-  PASS GET /health -> 200 {"status":"ok","tools":170}
-
-== initialize ==
-  PASS server=instantly@0.1.0 proto=2025-06-18 session=8d6f...
-
-== tools/list ==
-  PASS received 170 tools
-    - campaigns_list: List campaigns with filtering ...
-    ...
-```
-
-Verify a real Instantly key works end-to-end:
+### Tool call
 
 ```
 python test_mcp.py --catalog satva-instantly --key $INSTANTLY_KEY \
-  --call campaigns_list --args '{"limit": 1}'
+  --call campaigns_list --args '{"limit": 3}'
 ```
 
-A non-zero exit there means either the key is wrong, the user's plan
-doesn't expose that endpoint, or the upstream API changed shape.
+### Through O-Bot
 
-## When to use this vs. O-Bot UI
+Need the catalog entry's `mcp_id` from O-Bot's UI (look at the URL when
+viewing the MCP under Admin → MCP Servers/Registries):
 
-| Use this | Use O-Bot UI |
-|---|---|
-| Right after Coolify deploy finishes | After mapping the MCP into a registry |
-| Catalog YAML changed and you want to verify the URL/header is correct | Verifying an end-user's agent can pick up the tool |
-| Reproducing a bug report | Testing user permissions / group assignment |
+```
+python test_mcp.py --catalog satva-instantly --via-obot --mcp-id <mcp_id>
+```
 
-## Adding a new MCP to the smoke-test loop
+This routes the request through `https://obot.satva.xyz/mcp-connect/{mcp_id}/`
+with `Authorization: Bearer $OBOT_API_KEY`. If you also pass `--key`, the
+upstream MCP key is forwarded as the auth header (e.g. `x-instantly-api-key`)
+on top of the bearer; otherwise O-Bot uses whatever credentials it has stored
+for that catalog entry.
 
-No code change needed — once the catalog YAML is published, the script
-finds it by name. The convention `satva-<service>` keeps things tidy.
+### Liveness scan over the entire catalog (no per-MCP keys needed)
+
+```
+python test_mcp.py --scan-direct
+```
+
+Probes `/health` first, falls back to a bare-POST initialize. Anything below
+500 means the origin is reachable; only network errors / 5xx are flagged.
+
+```
+== scan-direct ==
+  PASS satva-basecamp.yaml      https://basecampmcp.satva.xyz/mcp/basecamp/  -> /health 200 ...
+  PASS satva-instantly.yaml     https://instantlymcp.satva.xyz/mcp/instantly/  -> /health 200 {"status":"ok","tools":170}
+  ...
+scan-direct: 11/11 alive
+```
+
+### Through-O-Bot scan
+
+Maintain a local mapping at `D:\oBot\.workspaces\obot-mcp-ids.json`:
+
+```json
+{
+  "satva-instantly": "<mcp_id_from_obot_ui>",
+  "satva-pipedrive": "<mcp_id_from_obot_ui>",
+  "_README": "Map keys are catalog YAML basenames; values are O-Bot catalog entry IDs."
+}
+```
+
+Then:
+
+```
+python test_mcp.py --scan-via-obot
+```
+
+Each entry runs an `initialize` through O-Bot and the row passes if O-Bot
+can route to it.
+
+### Catalog status
+
+```
+python test_mcp.py --catalog-status
+python test_mcp.py --catalog-status --mcp-id <mcp_id>   # also probe O-Bot for that id
+```
+
+Shows local catalog repo HEAD + the satva-*.yaml inventory. With `--mcp-id`,
+also probes O-Bot to confirm a specific catalog entry has been ingested.
+
+## Stages and exit codes
+
+| Stage | When it runs | Exit on fail |
+|---|---|---|
+| `health` | direct mode only — best-effort `GET /health` | warning, doesn't fail |
+| `initialize` | always — MCP `initialize` handshake | 2 |
+| `tools/list` | unless `--quick` | 3 |
+| `tools/call` | only with `--call` | 4 |
+| scan summary | `--scan-*` modes | 6 if any entry failed |
+
+Argument / config errors exit with `5`.
+
+## Verification flow after deploying a new MCP
+
+1. **Push the new fork** to GitHub and deploy to Coolify.
+2. **Direct probe** to confirm the MCP itself works:
+
+   ```
+   python test_mcp.py --catalog satva-newthing --key $KEY
+   ```
+3. **Push the catalog YAML** to `satva-git/mcp-catalog`.
+4. **Wait ~1 min** for O-Bot to poll the catalog.
+5. **Get the catalog entry id** from the O-Bot UI (URL when viewing the MCP).
+6. **Add it** to `obot-mcp-ids.json` and run:
+
+   ```
+   python test_mcp.py --catalog-status --mcp-id <id>
+   python test_mcp.py --catalog satva-newthing --via-obot --mcp-id <id>
+   ```
+7. **Map to a registry** in O-Bot Admin UI (one-time, not automatable).
+
+## Why no catalog-refresh API
+
+`pkg/api/authz/authz.go` defines `GroupAPIKey` with exactly two routes:
+`GET /api/me` and `/mcp-connect/`. Catalog management lives under
+`/api/mcp-catalogs/*` which is admin-only. There is no scope of
+programmatic API key that can refresh catalogs from outside O-Bot —
+GitOps polling is the only path. This is a deliberate design choice
+in O-Bot, not a missing feature in our automation.
+
+If that ever changes (Obot adds an admin-API-key group) we can drop the
+manual `obot-mcp-ids.json` and enumerate directly.
